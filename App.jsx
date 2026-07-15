@@ -9,6 +9,7 @@ import HomeScreen from './src/screens/HomeScreen';
 import EnrollScreen from './src/screens/EnrollScreen';
 import VerifyScreen from './src/screens/VerifyScreen';
 
+
 let onnxSession = null;
 
 export default function App() {

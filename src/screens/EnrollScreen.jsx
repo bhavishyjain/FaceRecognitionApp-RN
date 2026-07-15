@@ -14,6 +14,7 @@ import {
   TouchableOpacity,
   View,
   Platform,
+  useWindowDimensions,
 } from 'react-native';
 import {
   Camera,
@@ -24,7 +25,8 @@ import {
 } from 'react-native-vision-camera';
 import { useFaceDetector } from 'react-native-vision-camera-face-detector';
 import { Worklets, useSharedValue } from 'react-native-worklets-core';
-import Svg, { Path, Polyline } from 'react-native-svg';
+import Svg, { Path, Polyline, Ellipse } from 'react-native-svg';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import {
   preprocessFaceRGBA,
@@ -42,58 +44,135 @@ const ENROLL_STEPS = [
   { id: 'down', label: 'Look slightly down' },
 ];
 
+const YAW_SIGN = 1;
+const YAW_TARGET = 10;
+const YAW_FRONT_TOL = 15;
+const PITCH_TARGET = 6;
+const PITCH_TOL = 20;
+
+function clamp01(v) {
+  return Math.max(0, Math.min(1, v));
+}
+
 function assessFaceQuality(faces, frameWidth, stepId) {
   if (faces.length === 0) {
-    return { ok: false, reason: 'No face detected' };
+    return { ok: false, reason: 'No face detected', progress: 0 };
   }
   if (faces.length > 1) {
-    return { ok: false, reason: 'One face at a time' };
+    return { ok: false, reason: 'One face at a time', progress: 0 };
   }
 
   const face = faces[0];
   const ratio = face.bounds.width / frameWidth;
   if (ratio < 0.3) {
-    return { ok: false, reason: 'Move closer' };
+    return { ok: false, reason: 'Move closer', progress: 0 };
   }
   if (ratio > 0.85) {
-    return { ok: false, reason: 'Move back' };
+    return { ok: false, reason: 'Move back', progress: 0 };
   }
 
-  const yaw = face.yawAngle ?? 0;
+  const yaw = (face.yawAngle ?? 0) * YAW_SIGN;
   const pitch = face.pitchAngle ?? 0;
+  const yawR = Math.round(yaw);
+  const pitchR = Math.round(pitch);
+  let progress = 0;
 
   if (stepId === 'front') {
-    if (Math.abs(yaw) > 12) return { ok: false, reason: 'Look straight' };
-    if (Math.abs(pitch) > 12) return { ok: false, reason: 'Level your head' };
+    progress = clamp01(
+      1 - Math.max(Math.abs(yaw), Math.abs(pitch)) / YAW_FRONT_TOL,
+    );
+    if (Math.abs(yaw) > YAW_FRONT_TOL)
+      return { ok: false, reason: `Look straight (yaw ${yawR}°)`, progress };
+    if (Math.abs(pitch) > YAW_FRONT_TOL)
+      return {
+        ok: false,
+        reason: `Level your head (pitch ${pitchR}°)`,
+        progress,
+      };
   } else if (stepId === 'left') {
-    if (yaw < 10) return { ok: false, reason: 'Turn head left' };
-    if (Math.abs(pitch) > 15) return { ok: false, reason: 'Level your head' };
+    progress = clamp01(yaw / YAW_TARGET);
+    if (yaw < YAW_TARGET)
+      return {
+        ok: false,
+        reason: `Turn head left (yaw ${yawR}°/${YAW_TARGET}°)`,
+        progress,
+      };
+    if (Math.abs(pitch) > PITCH_TOL)
+      return {
+        ok: false,
+        reason: `Level your head (pitch ${pitchR}°)`,
+        progress,
+      };
   } else if (stepId === 'right') {
-    if (yaw > -10) return { ok: false, reason: 'Turn head right' };
-    if (Math.abs(pitch) > 15) return { ok: false, reason: 'Level your head' };
+    progress = clamp01(-yaw / YAW_TARGET);
+    if (yaw > -YAW_TARGET)
+      return {
+        ok: false,
+        reason: `Turn head right (yaw ${yawR}°/-${YAW_TARGET}°)`,
+        progress,
+      };
+    if (Math.abs(pitch) > PITCH_TOL)
+      return {
+        ok: false,
+        reason: `Level your head (pitch ${pitchR}°)`,
+        progress,
+      };
   } else if (stepId === 'up') {
-    if (Math.abs(yaw) > 15)
-      return { ok: false, reason: 'Face camera straight' };
-    if (pitch < 8) return { ok: false, reason: 'Look slightly up' };
+    progress = clamp01(pitch / PITCH_TARGET);
+    if (Math.abs(yaw) > YAW_FRONT_TOL)
+      return {
+        ok: false,
+        reason: `Face camera straight (yaw ${yawR}°)`,
+        progress,
+      };
+    if (pitch < PITCH_TARGET)
+      return {
+        ok: false,
+        reason: `Look slightly up (pitch ${pitchR}°/${PITCH_TARGET}°)`,
+        progress,
+      };
   } else if (stepId === 'down') {
-    if (Math.abs(yaw) > 15)
-      return { ok: false, reason: 'Face camera straight' };
-    if (pitch > -8) return { ok: false, reason: 'Look slightly down' };
+    progress = clamp01(-pitch / PITCH_TARGET);
+    if (Math.abs(yaw) > YAW_FRONT_TOL)
+      return {
+        ok: false,
+        reason: `Face camera straight (yaw ${yawR}°)`,
+        progress,
+      };
+    if (pitch > -PITCH_TARGET)
+      return {
+        ok: false,
+        reason: `Look slightly down (pitch ${pitchR}°/-${PITCH_TARGET}°)`,
+        progress,
+      };
   }
 
   const le = face.leftEyeOpenProbability ?? 1;
   const re = face.rightEyeOpenProbability ?? 1;
   if (le < 0.5 || re < 0.5) {
-    return { ok: false, reason: 'Open your eyes' };
+    return { ok: false, reason: 'Open your eyes', progress };
   }
 
-  return { ok: true, reason: 'Hold still…' };
+  return { ok: true, reason: 'Hold still…', progress: 1 };
 }
 
-const GOOD_MS = 1500;
+const GOOD_MS = 900;
 const COUNTDOWN = 3;
 
 export default function EnrollScreen({ session, onDone }) {
+  const insets = useSafeAreaInsets();
+  const { width: screenW, height: screenH } = useWindowDimensions();
+  const OVAL_W = 300;
+  const OVAL_H = 360;
+  const ovalCx = screenW / 2;
+  const ovalCy = screenH / 2;
+  const ovalRx = OVAL_W / 2;
+  const ovalRy = OVAL_H / 2;
+  const maskPath = `M0,0H${screenW}V${screenH}H0Z M${
+    ovalCx - ovalRx
+  },${ovalCy} A${ovalRx},${ovalRy} 0 1,0 ${
+    ovalCx + ovalRx
+  },${ovalCy} A${ovalRx},${ovalRy} 0 1,0 ${ovalCx - ovalRx},${ovalCy}Z`;
   const device = useCameraDevice('front');
   const format = useCameraFormat(device, [
     { photoResolution: { width: 640, height: 480 } },
@@ -102,7 +181,11 @@ export default function EnrollScreen({ session, onDone }) {
 
   const [hasPermission, setHasPermission] = useState(false);
   const [stage, setStage] = useState('scanning');
-  const [quality, setQuality] = useState({ ok: false, reason: 'Detecting…' });
+  const [quality, setQuality] = useState({
+    ok: false,
+    reason: 'Detecting…',
+    progress: 0,
+  });
   const [countdown, setCountdown] = useState(COUNTDOWN);
   const [name, setName] = useState('');
   const [pendingEmbed, setPendingEmbed] = useState(null);
@@ -115,6 +198,10 @@ export default function EnrollScreen({ session, onDone }) {
 
   const goodSinceRef = useRef(null);
   const capturedRef = useRef(false);
+  const stepIndexRef = useRef(0);
+  useEffect(() => {
+    stepIndexRef.current = stepIndex;
+  }, [stepIndex]);
 
   useEffect(() => {
     Camera.requestCameraPermission().then(s =>
@@ -153,7 +240,7 @@ export default function EnrollScreen({ session, onDone }) {
 
         collectedEmbedsRef.current.push(embedding);
 
-        const nextStep = stepIndex + 1;
+        const nextStep = stepIndexRef.current + 1;
         if (nextStep < 5) {
           setStepIndex(nextStep);
           capturedRef.current = false;
@@ -178,7 +265,7 @@ export default function EnrollScreen({ session, onDone }) {
         Alert.alert('Processing failed', err.message || String(err));
       }
     },
-    [stepIndex, session],
+    [session],
   );
 
   const onFacesDetectedJS = useCallback(
@@ -192,7 +279,7 @@ export default function EnrollScreen({ session, onDone }) {
         return;
       }
 
-      const currentStep = ENROLL_STEPS[stepIndex]?.id || 'front';
+      const currentStep = ENROLL_STEPS[stepIndexRef.current]?.id || 'front';
       const q = assessFaceQuality(faces, frameW, currentStep);
       setQuality(q);
 
@@ -220,7 +307,7 @@ export default function EnrollScreen({ session, onDone }) {
         setStage('scanning');
       }
     },
-    [stepIndex, processCapturedFrame, shouldCapture],
+    [processCapturedFrame, shouldCapture],
   );
 
   const onFacesDetected = useMemo(
@@ -232,7 +319,7 @@ export default function EnrollScreen({ session, onDone }) {
   const frameProcessor = useFrameProcessor(
     frame => {
       'worklet';
-      frameSkip.value = (frameSkip.value + 1) % 5;
+      frameSkip.value = (frameSkip.value + 1) % 3;
       if (frameSkip.value !== 0) return;
       runAsync(frame, () => {
         'worklet';
@@ -440,7 +527,7 @@ export default function EnrollScreen({ session, onDone }) {
     <View style={s.container}>
       <Camera
         ref={cameraRef}
-        style={StyleSheet.absoluteFill}
+        style={[StyleSheet.absoluteFill, { transform: [{ scaleX: -1 }] }]}
         device={device}
         format={format}
         isActive={isCameraActive}
@@ -448,11 +535,25 @@ export default function EnrollScreen({ session, onDone }) {
         pixelFormat={Platform.OS === 'ios' ? 'rgb' : 'yuv'}
       />
 
-      <View style={s.ovalWrapper} pointerEvents="none">
-        <View style={[s.oval, isGood && s.ovalGood]} />
-      </View>
+      <Svg
+        pointerEvents="none"
+        style={StyleSheet.absoluteFill}
+        width={screenW}
+        height={screenH}
+      >
+        <Path d={maskPath} fill="rgba(0,0,0,0.65)" fillRule="evenodd" />
+        <Ellipse
+          cx={ovalCx}
+          cy={ovalCy}
+          rx={ovalRx}
+          ry={ovalRy}
+          fill="none"
+          stroke={isGood ? C.success : 'rgba(250,250,250,0.6)'}
+          strokeWidth={isGood ? 3 : 2}
+        />
+      </Svg>
 
-      <View style={s.topBar}>
+      <View style={[s.topBar, { paddingTop: insets.top + 12 }]}>
         <TouchableOpacity
           id="btn-back-enroll"
           style={s.topBarBtn}
@@ -476,7 +577,7 @@ export default function EnrollScreen({ session, onDone }) {
         <View style={s.topBarBtn} />
       </View>
 
-      <View style={s.bottomCard}>
+      <View style={[s.instructionCard, { top: insets.top + 76 }]}>
         <View style={[s.statusIconContainer, isGood && s.statusIconGood]}>
           {stage === 'processing' ? (
             <ActivityIndicator color={C.accent} size="small" />
@@ -490,6 +591,19 @@ export default function EnrollScreen({ session, onDone }) {
             {statusLabel}
           </Text>
           <Text style={s.statusSub}>{statusSub}</Text>
+          {stage !== 'processing' && (
+            <View style={s.progressTrack}>
+              <View
+                style={[
+                  s.progressFill,
+                  {
+                    width: `${Math.round(quality.progress * 100)}%`,
+                    backgroundColor: isGood ? C.success : C.accent,
+                  },
+                ]}
+              />
+            </View>
+          )}
         </View>
 
         {stage === 'countdown' && (
@@ -525,20 +639,6 @@ const s = StyleSheet.create({
   },
   white: { color: C.text, fontSize: 16, lineHeight: 22 },
 
-  ovalWrapper: {
-    ...StyleSheet.absoluteFillObject,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  oval: {
-    width: 240,
-    height: 300,
-    borderRadius: 150,
-    borderWidth: 2,
-    borderColor: 'rgba(250,250,250,0.25)',
-  },
-  ovalGood: { borderColor: C.success, borderWidth: 3 },
-
   topBar: {
     position: 'absolute',
     top: 0,
@@ -547,7 +647,7 @@ const s = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingTop: 52,
+    paddingTop: 12,
     paddingBottom: 12,
     paddingHorizontal: 16,
     backgroundColor: 'rgba(9,9,11,0.5)',
@@ -568,22 +668,24 @@ const s = StyleSheet.create({
     textAlignVertical: 'center',
   },
 
-  bottomCard: {
+  instructionCard: {
     position: 'absolute',
-    bottom: 0,
-    left: 0,
-    right: 0,
-    backgroundColor: C.surface,
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-    paddingTop: 22,
-    paddingBottom: 36,
-    paddingHorizontal: 24,
+    left: 16,
+    right: 16,
+    backgroundColor: 'rgba(9,9,11,0.82)',
+    borderRadius: 20,
+    paddingVertical: 14,
+    paddingHorizontal: 18,
     flexDirection: 'row',
     alignItems: 'center',
-    borderTopWidth: 1,
-    borderTopColor: C.border,
+    borderWidth: 1,
+    borderColor: 'rgba(250,250,250,0.1)',
     gap: 14,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 6,
   },
   statusIconContainer: {
     width: 44,
@@ -613,6 +715,17 @@ const s = StyleSheet.create({
     lineHeight: 18,
     marginTop: 2,
     textAlignVertical: 'center',
+  },
+  progressTrack: {
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: C.cardElevated,
+    marginTop: 8,
+    overflow: 'hidden',
+  },
+  progressFill: {
+    height: '100%',
+    borderRadius: 2,
   },
   countdownBig: {
     color: C.success,

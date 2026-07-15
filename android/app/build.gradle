@@ -93,6 +93,9 @@ android {
             keyPassword 'android'
         }
     }
+     packagingOptions {
+        pickFirst '**/libreactnative.so'
+    }
     buildTypes {
         debug {
             signingConfig signingConfigs.debug

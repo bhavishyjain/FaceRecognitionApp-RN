@@ -1,4 +1,10 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
   ActivityIndicator,
   StyleSheet,
@@ -17,6 +23,7 @@ import {
 import { useFaceDetector } from 'react-native-vision-camera-face-detector';
 import { Worklets, useSharedValue } from 'react-native-worklets-core';
 import Svg, { Path, Circle, Polyline } from 'react-native-svg';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import {
   preprocessFaceRGBA,
@@ -49,6 +56,7 @@ function assessFaceQuality(faces, frameWidth) {
 const INFERENCE_INTERVAL_MS = 1000;
 
 export default function VerifyScreen({ session, onBack }) {
+  const insets = useSafeAreaInsets();
   const device = useCameraDevice('front');
   const format = useCameraFormat(device, [
     { photoResolution: { width: 640, height: 480 } },
@@ -84,58 +92,63 @@ export default function VerifyScreen({ session, onBack }) {
   const { detectFaces, stopListeners } = useFaceDetector(faceOptions);
   useEffect(() => () => stopListeners(), [stopListeners]);
 
-  const runInference = useCallback(async (cropArray, meanLuminance, isBlurry) => {
-    if (!session || inferringRef.current || verifiedRef.current) {
-      return;
-    }
-    inferringRef.current = true;
-    setIsInferring(true);
-
-    try {
-      if (isBlurry) {
-        setQuality({ ok: false, reason: 'Blurry - hold still' });
+  const runInference = useCallback(
+    async (cropArray, meanLuminance, isBlurry) => {
+      if (!session || inferringRef.current || verifiedRef.current) {
         return;
       }
-      if (meanLuminance < 40) {
-        setQuality({ ok: false, reason: 'Too dark' });
-        return;
-      }
-      if (meanLuminance > 220) {
-        setQuality({ ok: false, reason: 'Too bright' });
-        return;
-      }
+      inferringRef.current = true;
+      setIsInferring(true);
 
-      const float32 = new Float32Array(cropArray);
-      const embed = await getFaceEmbedding(float32, session);
-
-      let bestName = '';
-      let bestSim = -1;
-      for (const ef of enrolled) {
-        const sim = cosineSimilarity(embed, ef.embedding);
-        if (sim > bestSim) {
-          bestSim = sim;
-          bestName = ef.name;
+      try {
+        if (isBlurry) {
+          setQuality({ ok: false, reason: 'Blurry - hold still' });
+          return;
         }
-      }
+        if (meanLuminance < 40) {
+          setQuality({ ok: false, reason: 'Too dark' });
+          return;
+        }
+        if (meanLuminance > 220) {
+          setQuality({ ok: false, reason: 'Too bright' });
+          return;
+        }
 
-      if (bestName) {
-        console.log(`[Verify] Similarity score for ${bestName}: ${bestSim.toFixed(4)}`);
-      }
+        const float32 = new Float32Array(cropArray);
+        const embed = await getFaceEmbedding(float32, session);
 
-      const matched = bestSim >= MATCH_THRESHOLD;
-      setMatch({ name: bestName, similarity: bestSim, matched });
-      if (matched) {
-        verifiedRef.current = true;
-        setIsVerified(true);
-        setQuality({ ok: true, reason: 'Verified' });
+        let bestName = '';
+        let bestSim = -1;
+        for (const ef of enrolled) {
+          const sim = cosineSimilarity(embed, ef.embedding);
+          if (sim > bestSim) {
+            bestSim = sim;
+            bestName = ef.name;
+          }
+        }
+
+        if (bestName) {
+          console.log(
+            `[Verify] Similarity score for ${bestName}: ${bestSim.toFixed(4)}`,
+          );
+        }
+
+        const matched = bestSim >= MATCH_THRESHOLD;
+        setMatch({ name: bestName, similarity: bestSim, matched });
+        if (matched) {
+          verifiedRef.current = true;
+          setIsVerified(true);
+          setQuality({ ok: true, reason: 'Verified' });
+        }
+      } catch (err) {
+        console.error('[Verify] inference error:', err);
+      } finally {
+        inferringRef.current = false;
+        setIsInferring(false);
       }
-    } catch (err) {
-      console.error('[Verify] inference error:', err);
-    } finally {
-      inferringRef.current = false;
-      setIsInferring(false);
-    }
-  }, [session, enrolled]);
+    },
+    [session, enrolled],
+  );
 
   const onFacesDetectedJS = useCallback(
     (faces, fw, fh, cropArray, meanLuminance, isBlurry) => {
@@ -188,12 +201,24 @@ export default function VerifyScreen({ session, onBack }) {
           if (faces.length === 1) {
             const buffer = frame.toArrayBuffer();
             const yuv = new Uint8Array(buffer);
-            const float32 = preprocessFaceRGBA(yuv, frame.width, frame.height, faces[0]);
+            const float32 = preprocessFaceRGBA(
+              yuv,
+              frame.width,
+              frame.height,
+              faces[0],
+            );
             cropArray = Array.from(float32);
             meanLuminance = float32.meanLuminance;
             isBlurry = float32.isBlurry;
           }
-          onFacesDetected(faces, frame.width, frame.height, cropArray, meanLuminance, isBlurry);
+          onFacesDetected(
+            faces,
+            frame.width,
+            frame.height,
+            cropArray,
+            meanLuminance,
+            isBlurry,
+          );
         } else {
           onFacesDetected(faces, frame.width, frame.height, null, 0, false);
         }
@@ -244,7 +269,7 @@ export default function VerifyScreen({ session, onBack }) {
         pixelFormat={Platform.OS === 'ios' ? 'rgb' : 'yuv'}
       />
 
-      <View style={s.topBar}>
+      <View style={[s.topBar, { paddingTop: insets.top + 12 }]}>
         <TouchableOpacity
           id="btn-back-verify"
           style={s.backBtn}
@@ -273,7 +298,7 @@ export default function VerifyScreen({ session, onBack }) {
         <Text style={s.qualityText}>{quality.reason}</Text>
       </View>
 
-      <View style={s.bottomCard}>
+      <View style={[s.bottomCard, { paddingBottom: insets.bottom + 16 }]}>
         <View
           style={[
             s.statusIconContainer,
@@ -402,7 +427,7 @@ const s = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingTop: 52,
+    paddingTop: 12,
     paddingBottom: 12,
     paddingHorizontal: 16,
     backgroundColor: 'rgba(9,9,11,0.5)',
@@ -453,7 +478,7 @@ const s = StyleSheet.create({
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
     paddingTop: 28,
-    paddingBottom: 40,
+    paddingBottom: 16,
     paddingHorizontal: 24,
     alignItems: 'center',
     borderTopWidth: 1,
