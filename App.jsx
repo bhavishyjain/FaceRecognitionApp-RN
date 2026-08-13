@@ -9,8 +9,48 @@ import HomeScreen from './src/screens/HomeScreen';
 import EnrollScreen from './src/screens/EnrollScreen';
 import VerifyScreen from './src/screens/VerifyScreen';
 
-
 let onnxSession = null;
+let onnxFASSession = null;
+
+async function copyBundledModelToCache(modelAsset, outputName, onProgress) {
+  const assetSource = Image.resolveAssetSource(modelAsset);
+  const sourceUri = assetSource.uri;
+  const cachedPath = `${RNFS.CachesDirectoryPath}/${outputName}`;
+
+  if (await RNFS.exists(cachedPath)) {
+    return cachedPath;
+  }
+
+  const tmpPath = `${cachedPath}.tmp`;
+  if (await RNFS.exists(tmpPath)) {
+    await RNFS.unlink(tmpPath);
+  }
+
+  if (sourceUri.startsWith('http://') || sourceUri.startsWith('https://')) {
+    const task = RNFS.downloadFile({
+      fromUrl: sourceUri,
+      toFile: tmpPath,
+      progressDivider: 1,
+      progress: res => {
+        if (res.contentLength > 0 && onProgress) {
+          onProgress(Math.round((res.bytesWritten / res.contentLength) * 100));
+        }
+      },
+    });
+
+    const result = await task.promise;
+    if (result.statusCode < 200 || result.statusCode >= 300) {
+      throw new Error(`${outputName} download failed: HTTP ${result.statusCode}`);
+    }
+  } else if (sourceUri.startsWith('file://')) {
+    await RNFS.copyFile(decodeURI(sourceUri.replace('file://', '')), tmpPath);
+  } else {
+    await RNFS.copyFile(sourceUri, tmpPath);
+  }
+
+  await RNFS.moveFile(tmpPath, cachedPath);
+  return cachedPath;
+}
 
 export default function App() {
   const [screen, setScreen] = useState('home');
@@ -26,7 +66,7 @@ export default function App() {
     let cancelled = false;
 
     async function loadModel() {
-      if (onnxSession !== null) {
+      if (onnxSession !== null && onnxFASSession !== null) {
         setModelLoaded(true);
         return;
       }
@@ -35,15 +75,15 @@ export default function App() {
         const modelAsset = require('./assets/models/arcface.onnx');
         const assetSource = Image.resolveAssetSource(modelAsset);
         const remoteUri = assetSource.uri;
-        const cachedPath = `${RNFS.CachesDirectoryPath}/arcface.onnx`;
+        const cachedPath = `${RNFS.CachesDirectoryPath}/arcface_nhwc_v2.onnx`;
 
-        console.log('[ONNX] URI:', remoteUri);
-        console.log('[ONNX] Cache:', cachedPath);
-
-        const isCached = await RNFS.exists(cachedPath);
+        let isCached = await RNFS.exists(cachedPath);
+        if (!isCached && !remoteUri.startsWith('http')) {
+          await copyBundledModelToCache(modelAsset, 'arcface_nhwc_v2.onnx');
+          isCached = true;
+        }
 
         if (!isCached) {
-          console.log('[ONNX] First launch — streaming to disk…');
           if (await RNFS.exists(cachedPath)) {
             await RNFS.unlink(cachedPath);
           }
@@ -52,7 +92,6 @@ export default function App() {
             fromUrl: remoteUri,
             toFile: cachedPath,
             progressDivider: 1,
-            begin: () => console.log('[ONNX] Download started'),
             progress: res => {
               if (cancelled) {
                 return;
@@ -75,29 +114,72 @@ export default function App() {
             return;
           }
           if (result.statusCode !== 200) {
-            throw new Error(`Download failed: HTTP ${result.statusCode}`);
+            throw new Error(
+              `ArcFace download failed: HTTP ${result.statusCode}`,
+            );
           }
-          console.log('[ONNX] Download complete — bytes:', result.bytesWritten);
-        } else {
-          console.log('[ONNX] Cache hit — loading from disk');
         }
 
         if (cancelled) {
           return;
         }
-        console.log('[ONNX] Creating InferenceSession…');
+        const fasAsset = require('./assets/models/minifasnet_v2.onnx');
+        const fasSource = Image.resolveAssetSource(fasAsset);
+        const fasRemoteUri = fasSource.uri;
+        const fasCachedPath = `${RNFS.CachesDirectoryPath}/minifasnet_v2.onnx`;
+
+        let isFasCached = await RNFS.exists(fasCachedPath);
+        if (!isFasCached && !fasRemoteUri.startsWith('http')) {
+          await copyBundledModelToCache(fasAsset, 'minifasnet_v2.onnx');
+          isFasCached = true;
+        }
+
+        if (!isFasCached) {
+          if (await RNFS.exists(fasCachedPath)) {
+            await RNFS.unlink(fasCachedPath);
+          }
+
+          const task = RNFS.downloadFile({
+            fromUrl: fasRemoteUri,
+            toFile: fasCachedPath,
+            progressDivider: 1,
+            progress: () => {},
+          });
+
+          const result = await task.promise;
+          if (cancelled) {
+            await RNFS.exists(fasCachedPath).then(e => {
+              if (e) {
+                RNFS.unlink(fasCachedPath);
+              }
+            });
+            return;
+          }
+          if (result.statusCode !== 200) {
+            throw new Error(
+              `MiniFASNet download failed: HTTP ${result.statusCode}`,
+            );
+          }
+        }
+
+        if (cancelled) {
+          return;
+        }
+
         const session = await InferenceSession.create(`file://${cachedPath}`);
         if (cancelled) {
           return;
         }
-
         onnxSession = session;
-        console.log(
-          '[ONNX] Ready — inputs:',
-          session.inputNames,
-          'outputs:',
-          session.outputNames,
+
+        const fasSession = await InferenceSession.create(
+          `file://${fasCachedPath}`,
         );
+        if (cancelled) {
+          return;
+        }
+        onnxFASSession = fasSession;
+
         setModelLoaded(true);
       } catch (e) {
         console.error('[ONNX] Failed:', e);
@@ -150,8 +232,8 @@ export default function App() {
             <>
               <Text style={s.loadingSubtitle}>
                 {loadProgress > 0
-                  ? `Downloading model… ${loadProgress}%`
-                  : 'Loading model from cache…'}
+                  ? `Downloading models… ${loadProgress}%`
+                  : 'Loading models from cache…'}
               </Text>
 
               <View style={s.progressTrack}>
@@ -194,8 +276,12 @@ export default function App() {
       {screen === 'enroll' && onnxSession && (
         <EnrollScreen session={onnxSession} onDone={() => setScreen('home')} />
       )}
-      {screen === 'verify' && onnxSession && (
-        <VerifyScreen session={onnxSession} onBack={() => setScreen('home')} />
+      {screen === 'verify' && onnxSession && onnxFASSession && (
+        <VerifyScreen
+          session={onnxSession}
+          fasSession={onnxFASSession}
+          onBack={() => setScreen('home')}
+        />
       )}
     </SafeAreaProvider>
   );

@@ -159,6 +159,23 @@ function assessFaceQuality(faces, frameWidth, stepId) {
 const GOOD_MS = 900;
 const COUNTDOWN = 3;
 
+function getPrimaryFace(faces) {
+  'worklet';
+  if (!faces || faces.length === 0) {
+    return null;
+  }
+  let primary = faces[0];
+  let maxArea = primary.bounds.width * primary.bounds.height;
+  for (let i = 1; i < faces.length; i++) {
+    const area = faces[i].bounds.width * faces[i].bounds.height;
+    if (area > maxArea) {
+      primary = faces[i];
+      maxArea = area;
+    }
+  }
+  return primary;
+}
+
 export default function EnrollScreen({ session, onDone }) {
   const insets = useSafeAreaInsets();
   const { width: screenW, height: screenH } = useWindowDimensions();
@@ -324,26 +341,28 @@ export default function EnrollScreen({ session, onDone }) {
       runAsync(frame, () => {
         'worklet';
         const faces = detectFaces(frame);
+        const primaryFace = getPrimaryFace(faces);
+        const selectedFaces = primaryFace ? [primaryFace] : [];
         if (shouldCapture.value) {
           shouldCapture.value = false;
           let cropArray = null;
           let meanLuminance = 0;
           let isBlurry = false;
-          if (faces.length === 1) {
+          if (primaryFace) {
             const buffer = frame.toArrayBuffer();
             const yuv = new Uint8Array(buffer);
             const float32 = preprocessFaceRGBA(
               yuv,
               frame.width,
               frame.height,
-              faces[0],
+              primaryFace,
             );
             cropArray = Array.from(float32);
             meanLuminance = float32.meanLuminance;
             isBlurry = float32.isBlurry;
           }
           onFacesDetected(
-            faces,
+            selectedFaces,
             frame.width,
             frame.height,
             cropArray,
@@ -351,11 +370,18 @@ export default function EnrollScreen({ session, onDone }) {
             isBlurry,
           );
         } else {
-          onFacesDetected(faces, frame.width, frame.height, null, 0, false);
+          onFacesDetected(
+            selectedFaces,
+            frame.width,
+            frame.height,
+            null,
+            0,
+            false,
+          );
         }
       });
     },
-    [onFacesDetected, preprocessFaceRGBA],
+    [onFacesDetected, preprocessFaceRGBA, getPrimaryFace],
   );
 
   const handleSave = useCallback(async () => {

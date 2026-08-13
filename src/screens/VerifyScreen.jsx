@@ -24,14 +24,52 @@ import { useFaceDetector } from 'react-native-vision-camera-face-detector';
 import { Worklets, useSharedValue } from 'react-native-worklets-core';
 import Svg, { Path, Circle, Polyline } from 'react-native-svg';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-
 import {
   preprocessFaceRGBA,
+  preprocessFaceFAS,
   getFaceEmbedding,
+  runMiniFASNet,
+  getLivenessScore,
+  LIVENESS_THRESHOLD,
   cosineSimilarity,
   MATCH_THRESHOLD,
 } from '../helpers/faceRecognition';
 import { loadAllEmbeddings } from '../helpers/storage';
+
+const INFERENCE_INTERVAL_MS = 150;
+const TRACKING_THRESHOLD = 3;
+
+function isSameFace(face1, face2, frameWidth, frameHeight) {
+  if (!face1 || !face2) return false;
+
+  if (
+    face1.trackingId !== undefined &&
+    face1.trackingId !== null &&
+    face2.trackingId !== undefined &&
+    face2.trackingId !== null
+  ) {
+    return face1.trackingId === face2.trackingId;
+  }
+
+  const b1 = face1.bounds;
+  const b2 = face2.bounds;
+  if (!b1 || !b2) return false;
+
+  const c1x = b1.x + b1.width / 2;
+  const c1y = b1.y + b1.height / 2;
+  const c2x = b2.x + b2.width / 2;
+  const c2y = b2.y + b2.height / 2;
+
+  const dist = Math.sqrt(Math.pow(c1x - c2x, 2) + Math.pow(c1y - c2y, 2));
+  const maxDim = Math.max(frameWidth, frameHeight) || 1;
+  const normalizedDist = dist / maxDim;
+
+  const area1 = b1.width * b1.height;
+  const area2 = b2.width * b2.height;
+  const sizeRatio = Math.max(area1, area2) / Math.min(area1, area2);
+
+  return normalizedDist < 0.15 && sizeRatio < 1.5;
+}
 
 function assessFaceQuality(faces, frameWidth) {
   if (faces.length === 0) {
@@ -41,8 +79,12 @@ function assessFaceQuality(faces, frameWidth) {
     return { ok: false, reason: 'One face at a time' };
   }
   const face = faces[0];
-  if (face.bounds.width / frameWidth < 0.25) {
+  const ratio = face.bounds.width / frameWidth;
+  if (ratio < 0.25) {
     return { ok: false, reason: 'Move closer' };
+  }
+  if (ratio > 0.5) {
+    return { ok: false, reason: 'Move back' };
   }
   if (Math.abs(face.yawAngle ?? 0) > 20) {
     return { ok: false, reason: 'Face camera straight on' };
@@ -53,15 +95,29 @@ function assessFaceQuality(faces, frameWidth) {
   return { ok: true, reason: 'Analysing…' };
 }
 
-const INFERENCE_INTERVAL_MS = 1000;
+function getPrimaryFace(faces) {
+  'worklet';
+  if (!faces || faces.length === 0) {
+    return null;
+  }
+  let primary = faces[0];
+  let maxArea = primary.bounds.width * primary.bounds.height;
+  for (let i = 1; i < faces.length; i++) {
+    const area = faces[i].bounds.width * faces[i].bounds.height;
+    if (area > maxArea) {
+      primary = faces[i];
+      maxArea = area;
+    }
+  }
+  return primary;
+}
 
-export default function VerifyScreen({ session, onBack }) {
+export default function VerifyScreen({ session, fasSession, onBack }) {
   const insets = useSafeAreaInsets();
   const device = useCameraDevice('front');
   const format = useCameraFormat(device, [
     { photoResolution: { width: 640, height: 480 } },
   ]);
-  const cameraRef = useRef(null);
 
   const [hasPermission, setHasPermission] = useState(false);
   const [quality, setQuality] = useState({ ok: false, reason: 'Detecting…' });
@@ -70,10 +126,13 @@ export default function VerifyScreen({ session, onBack }) {
   const [isVerified, setIsVerified] = useState(false);
   const [enrolled, setEnrolled] = useState([]);
   const shouldCapture = useSharedValue(false);
-
   const lastInferenceRef = useRef(0);
   const inferringRef = useRef(false);
   const verifiedRef = useRef(false);
+  const trackedFramesCountRef = useRef(0);
+  const prevFaceRef = useRef(null);
+  const blinkPhaseRef = useRef('eyes-open');
+  const [blinkDetected, setBlinkDetected] = useState(false);
 
   useEffect(() => {
     Camera.requestCameraPermission().then(s =>
@@ -86,15 +145,20 @@ export default function VerifyScreen({ session, onBack }) {
     performanceMode: 'fast',
     landmarkMode: 'all',
     contourMode: 'none',
-    classificationMode: 'none',
+    classificationMode: 'all',
     minFaceSize: 0.15,
   }).current;
   const { detectFaces, stopListeners } = useFaceDetector(faceOptions);
   useEffect(() => () => stopListeners(), [stopListeners]);
 
   const runInference = useCallback(
-    async (cropArray, meanLuminance, isBlurry) => {
-      if (!session || inferringRef.current || verifiedRef.current) {
+    async (cropArray, fasCropArray, meanLuminance, isBlurry) => {
+      if (
+        !session ||
+        !fasSession ||
+        inferringRef.current ||
+        verifiedRef.current
+      ) {
         return;
       }
       inferringRef.current = true;
@@ -102,7 +166,7 @@ export default function VerifyScreen({ session, onBack }) {
 
       try {
         if (isBlurry) {
-          setQuality({ ok: false, reason: 'Blurry - hold still' });
+          setQuality({ ok: false, reason: 'Blurry — hold still' });
           return;
         }
         if (meanLuminance < 40) {
@@ -111,6 +175,22 @@ export default function VerifyScreen({ session, onBack }) {
         }
         if (meanLuminance > 220) {
           setQuality({ ok: false, reason: 'Too bright' });
+          return;
+        }
+
+        const fasFloat32 = new Float32Array(fasCropArray);
+        const livenessLogits = await runMiniFASNet(fasSession, fasFloat32);
+        const livenessScore = getLivenessScore(livenessLogits);
+        const livenessPassed = livenessScore >= LIVENESS_THRESHOLD;
+
+        if (!livenessPassed) {
+          setQuality({ ok: false, reason: 'Spoof detected' });
+          setMatch({
+            name: 'Spoof Detected',
+            similarity: 0,
+            matched: false,
+            isSpoof: true,
+          });
           return;
         }
 
@@ -127,18 +207,19 @@ export default function VerifyScreen({ session, onBack }) {
           }
         }
 
-        if (bestName) {
-          console.log(
-            `[Verify] Similarity score for ${bestName}: ${bestSim.toFixed(4)}`,
-          );
-        }
-
         const matched = bestSim >= MATCH_THRESHOLD;
-        setMatch({ name: bestName, similarity: bestSim, matched });
+        setMatch({
+          name: bestName,
+          similarity: bestSim,
+          matched,
+          isSpoof: false,
+        });
         if (matched) {
           verifiedRef.current = true;
           setIsVerified(true);
           setQuality({ ok: true, reason: 'Verified' });
+        } else {
+          setQuality({ ok: false, reason: 'Not recognized' });
         }
       } catch (err) {
         console.error('[Verify] inference error:', err);
@@ -147,26 +228,81 @@ export default function VerifyScreen({ session, onBack }) {
         setIsInferring(false);
       }
     },
-    [session, enrolled],
+    [session, fasSession, enrolled],
   );
 
   const onFacesDetectedJS = useCallback(
-    (faces, fw, fh, cropArray, meanLuminance, isBlurry) => {
+    (faces, fw, fh, cropArray, fasCropArray, meanLuminance, isBlurry) => {
       if (verifiedRef.current) {
         return;
       }
 
-      if (cropArray) {
-        runInference(cropArray, meanLuminance, isBlurry);
+      if (cropArray && fasCropArray) {
+        runInference(cropArray, fasCropArray, meanLuminance, isBlurry);
+        return;
+      }
+
+      if (faces.length === 0) {
+        trackedFramesCountRef.current = 0;
+        prevFaceRef.current = null;
+        blinkPhaseRef.current = 'eyes-open';
+        setBlinkDetected(false);
+        setQuality({ ok: false, reason: 'No face detected' });
+        setMatch(null);
+        return;
+      }
+
+      const currentFace = faces[0];
+      const isSame = isSameFace(currentFace, prevFaceRef.current, fw, fh);
+
+      if (isSame) {
+        trackedFramesCountRef.current += 1;
+      } else {
+        trackedFramesCountRef.current = 1;
+        blinkPhaseRef.current = 'eyes-open';
+        setBlinkDetected(false);
+        setMatch(null);
+      }
+      prevFaceRef.current = currentFace;
+
+      const count = Math.min(trackedFramesCountRef.current, TRACKING_THRESHOLD);
+
+      if (trackedFramesCountRef.current < TRACKING_THRESHOLD) {
+        setQuality({
+          ok: false,
+          reason: `Stabilizing… (${count}/${TRACKING_THRESHOLD})`,
+        });
         return;
       }
 
       const q = assessFaceQuality(faces, fw);
-      setQuality(q);
+      if (!q.ok) {
+        setQuality(q);
+        return;
+      }
 
+      if (blinkPhaseRef.current !== 'done') {
+        const le = currentFace.leftEyeOpenProbability ?? 1;
+        const re = currentFace.rightEyeOpenProbability ?? 1;
+        const bothOpen = le > 0.75 && re > 0.75;
+        const bothClosed = le < 0.35 && re < 0.35;
+
+        if (blinkPhaseRef.current === 'eyes-open' && bothClosed) {
+          blinkPhaseRef.current = 'eyes-closed';
+        } else if (blinkPhaseRef.current === 'eyes-closed' && bothOpen) {
+          blinkPhaseRef.current = 'done';
+          setBlinkDetected(true);
+          lastInferenceRef.current = Date.now();
+          shouldCapture.value = true;
+        }
+
+        setQuality({ ok: true, reason: 'Blink once to verify' });
+        return;
+      }
+
+      setQuality({ ok: true, reason: 'Hold still…' });
       const now = Date.now();
       if (
-        q.ok &&
         !inferringRef.current &&
         now - lastInferenceRef.current >= INFERENCE_INTERVAL_MS
       ) {
@@ -193,38 +329,60 @@ export default function VerifyScreen({ session, onBack }) {
       runAsync(frame, () => {
         'worklet';
         const faces = detectFaces(frame);
+        const primaryFace = getPrimaryFace(faces);
+        const selectedFaces = primaryFace ? [primaryFace] : [];
         if (shouldCapture.value) {
           shouldCapture.value = false;
           let cropArray = null;
+          let fasCropArray = null;
           let meanLuminance = 0;
           let isBlurry = false;
-          if (faces.length === 1) {
+          if (primaryFace) {
             const buffer = frame.toArrayBuffer();
             const yuv = new Uint8Array(buffer);
+
             const float32 = preprocessFaceRGBA(
               yuv,
               frame.width,
               frame.height,
-              faces[0],
+              primaryFace,
             );
             cropArray = Array.from(float32);
             meanLuminance = float32.meanLuminance;
             isBlurry = float32.isBlurry;
+
+            const fasFloat32 = preprocessFaceFAS(
+              yuv,
+              frame.width,
+              frame.height,
+              primaryFace,
+              2.7,
+            );
+            fasCropArray = Array.from(fasFloat32);
           }
           onFacesDetected(
-            faces,
+            selectedFaces,
             frame.width,
             frame.height,
             cropArray,
+            fasCropArray,
             meanLuminance,
             isBlurry,
           );
         } else {
-          onFacesDetected(faces, frame.width, frame.height, null, 0, false);
+          onFacesDetected(
+            selectedFaces,
+            frame.width,
+            frame.height,
+            null,
+            null,
+            0,
+            false,
+          );
         }
       });
     },
-    [onFacesDetected, preprocessFaceRGBA],
+    [onFacesDetected, preprocessFaceRGBA, preprocessFaceFAS, getPrimaryFace],
   );
 
   if (!hasPermission) {
@@ -242,25 +400,43 @@ export default function VerifyScreen({ session, onBack }) {
     );
   }
 
+  const isSpoof = match?.isSpoof;
+  const isMatched = match?.matched;
+  const isNoMatch = match && !match.isSpoof && !match.matched && !isInferring;
+
+  const statusColor = isMatched
+    ? C.success
+    : isSpoof || isNoMatch
+    ? C.danger
+    : C.text;
+
   const matchLabel = isInferring
     ? 'Scanning…'
-    : match?.matched
+    : isSpoof
+    ? 'Spoof Detected'
+    : isMatched
     ? match.name
-    : match
-    ? 'No match'
-    : 'Position your face in view';
+    : isNoMatch
+    ? 'Not Recognized'
+    : blinkDetected
+    ? 'Verifying…'
+    : 'Ready to Verify';
 
-  const matchSim =
-    match && !isInferring
-      ? `${(match.similarity * 100).toFixed(1)}% confidence`
-      : isInferring
-      ? 'Comparing against enrolled faces'
-      : 'The entire screen is the capture area';
+  const matchSub = isInferring
+    ? 'Running face recognition'
+    : isSpoof
+    ? 'Liveness check failed'
+    : isMatched
+    ? `${(match.similarity * 100).toFixed(1)}% match`
+    : isNoMatch
+    ? `${(match.similarity * 100).toFixed(1)}% — below threshold`
+    : blinkDetected
+    ? 'Processing…'
+    : 'Look at the camera, then blink once';
 
   return (
     <View style={s.container}>
       <Camera
-        ref={cameraRef}
         style={StyleSheet.absoluteFill}
         device={device}
         format={format}
@@ -269,19 +445,20 @@ export default function VerifyScreen({ session, onBack }) {
         pixelFormat={Platform.OS === 'ios' ? 'rgb' : 'yuv'}
       />
 
-      <View style={[s.topBar, { paddingTop: insets.top + 12 }]}>
+      <View style={[s.topBar, { paddingTop: insets.top + 10 }]}>
         <TouchableOpacity
           id="btn-back-verify"
           style={s.backBtn}
           onPress={onBack}
+          activeOpacity={0.7}
         >
           <Svg
-            width={20}
-            height={20}
+            width={18}
+            height={18}
             viewBox="0 0 24 24"
             fill="none"
             stroke="#fff"
-            strokeWidth={2}
+            strokeWidth={2.5}
             strokeLinecap="round"
             strokeLinejoin="round"
           >
@@ -293,98 +470,107 @@ export default function VerifyScreen({ session, onBack }) {
         <View style={s.backBtn} />
       </View>
 
-      <View style={s.qualityPill}>
-        <View style={[s.dot, quality.ok ? s.dotGreen : s.dotRed]} />
-        <Text style={s.qualityText}>{quality.reason}</Text>
-      </View>
-
-      <View style={[s.bottomCard, { paddingBottom: insets.bottom + 16 }]}>
+      <View style={s.statusBadge}>
         <View
           style={[
-            s.statusIconContainer,
-            match?.matched && s.statusIconSuccess,
-            match && !match.matched && !isInferring && s.statusIconDanger,
+            s.statusDot,
+            { backgroundColor: quality.ok ? C.success : C.amber },
           ]}
-        >
-          {isInferring ? (
-            <ActivityIndicator color={C.accent} size="small" />
-          ) : match?.matched ? (
-            <Svg
-              width={28}
-              height={28}
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke={C.success}
-              strokeWidth={2}
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <Path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
-              <Polyline points="22 4 12 14.01 9 11.01" />
-            </Svg>
-          ) : match ? (
-            <Svg
-              width={28}
-              height={28}
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke={C.danger}
-              strokeWidth={2}
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <Circle cx="12" cy="12" r="10" />
-              <Path d="M15 9l-6 6" />
-              <Path d="M9 9l6 6" />
-            </Svg>
-          ) : (
-            <Svg
-              width={28}
-              height={28}
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke={C.primaryMuted}
-              strokeWidth={1.5}
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <Path d="M4 8V6a2 2 0 0 1 2-2h2" />
-              <Path d="M4 16v2a2 2 0 0 1 2 2h2" />
-              <Path d="M16 4h2a2 2 0 0 1 2 2v2" />
-              <Path d="M16 20h2a2 2 0 0 1 2-2v-2" />
-            </Svg>
-          )}
+        />
+        <Text style={s.statusBadgeText}>{quality.reason}</Text>
+      </View>
+
+      <View style={[s.panel, { paddingBottom: insets.bottom + 20 }]}>
+        <View style={s.panelInner}>
+          <View style={[s.iconRing, { borderColor: statusColor + '40' }]}>
+            {isInferring ? (
+              <ActivityIndicator color={statusColor} size="small" />
+            ) : isSpoof ? (
+              <Svg
+                width={24}
+                height={24}
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke={C.danger}
+                strokeWidth={2}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <Circle cx="12" cy="12" r="10" />
+                <Path d="M15 9l-6 6" />
+                <Path d="M9 9l6 6" />
+              </Svg>
+            ) : isMatched ? (
+              <Svg
+                width={24}
+                height={24}
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke={C.success}
+                strokeWidth={2}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <Path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+                <Polyline points="22 4 12 14.01 9 11.01" />
+              </Svg>
+            ) : isNoMatch ? (
+              <Svg
+                width={24}
+                height={24}
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke={C.danger}
+                strokeWidth={2}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <Circle cx="12" cy="12" r="10" />
+                <Path d="M15 9l-6 6" />
+                <Path d="M9 9l6 6" />
+              </Svg>
+            ) : (
+              <Svg
+                width={24}
+                height={24}
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke={C.muted}
+                strokeWidth={1.5}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <Path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                <Circle cx="12" cy="12" r="3" />
+              </Svg>
+            )}
+          </View>
+
+          <View style={s.textBlock}>
+            <Text style={[s.label, { color: statusColor }]}>{matchLabel}</Text>
+            <Text style={s.sub}>{matchSub}</Text>
+          </View>
         </View>
 
-        <Text
-          style={[
-            s.resultName,
-            match?.matched && { color: C.success },
-            match && !match.matched && !isInferring && { color: C.danger },
-          ]}
-        >
-          {matchLabel}
-        </Text>
-        <Text style={s.resultSub}>{matchSim}</Text>
-
-        {match && !isInferring && (
-          <View style={s.simBarTrack}>
+        {match && !isSpoof && !isInferring && (
+          <View style={s.simTrack}>
             <View
               style={[
-                s.simBarFill,
+                s.simFill,
                 {
                   width: `${Math.max(match.similarity * 100, 2)}%`,
-                  backgroundColor: match.matched ? C.success : C.danger,
+                  backgroundColor: isMatched ? C.success : C.danger,
                 },
               ]}
             />
           </View>
         )}
+
         {isVerified && (
           <TouchableOpacity
             style={s.doneBtn}
             onPress={onBack}
-            activeOpacity={0.85}
+            activeOpacity={0.8}
           >
             <Text style={s.doneBtnText}>Done</Text>
           </TouchableOpacity>
@@ -395,29 +581,33 @@ export default function VerifyScreen({ session, onBack }) {
 }
 
 const C = {
-  surface: '#09090B',
-  card: '#18181B',
-  cardElevated: '#27272A',
-  border: '#27272A',
-  primary: '#FAFAFA',
-  primaryMuted: '#A1A1AA',
+  bg: '#0A0A0A',
+  panel: '#111111',
+  border: '#1F1F1F',
+  text: '#F5F5F5',
+  muted: '#555555',
+  sub: '#888888',
   accent: '#3B82F6',
   success: '#22C55E',
   danger: '#EF4444',
-  text: '#FAFAFA',
-  textSecondary: '#A1A1AA',
-  textTertiary: '#52525B',
+  amber: '#F59E0B',
 };
 
 const s = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#000' },
+  container: {
+    flex: 1,
+    backgroundColor: C.bg,
+  },
   center: {
     flex: 1,
-    backgroundColor: C.surface,
+    backgroundColor: C.bg,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  white: { color: C.text, fontSize: 16, lineHeight: 22 },
+  white: {
+    color: C.text,
+    fontSize: 15,
+  },
 
   topBar: {
     position: 'absolute',
@@ -427,119 +617,117 @@ const s = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingTop: 12,
     paddingBottom: 12,
     paddingHorizontal: 16,
-    backgroundColor: 'rgba(9,9,11,0.5)',
+    backgroundColor: 'rgba(10,10,10,0.72)',
   },
   backBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+    width: 36,
+    height: 36,
     alignItems: 'center',
     justifyContent: 'center',
   },
   topTitle: {
     color: C.text,
-    fontSize: 17,
-    lineHeight: 24,
-    fontWeight: '700',
-    letterSpacing: 0.3,
+    fontSize: 16,
+    fontWeight: '600',
+    letterSpacing: 0.2,
+    lineHeight: 20,
   },
 
-  qualityPill: {
+  statusBadge: {
     position: 'absolute',
-    top: 108,
+    top: 110,
     alignSelf: 'center',
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: 'rgba(9,9,11,0.6)',
+    backgroundColor: 'rgba(10,10,10,0.75)',
     paddingHorizontal: 14,
-    paddingVertical: 6,
-    borderRadius: 16,
-    gap: 6,
+    paddingVertical: 7,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    gap: 7,
   },
-  dot: { width: 8, height: 8, borderRadius: 4 },
-  dotGreen: { backgroundColor: C.success },
-  dotRed: { backgroundColor: C.danger },
-  qualityText: {
+  statusDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 3.5,
+  },
+  statusBadgeText: {
+    lineHeight: 16,
     color: C.text,
     fontSize: 12,
-    lineHeight: 18,
-    fontWeight: '600',
+    fontWeight: '500',
+    letterSpacing: 0.1,
   },
 
-  bottomCard: {
+  panel: {
     position: 'absolute',
     bottom: 0,
     left: 0,
     right: 0,
-    backgroundColor: C.surface,
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-    paddingTop: 28,
-    paddingBottom: 16,
-    paddingHorizontal: 24,
-    alignItems: 'center',
+    backgroundColor: C.panel,
     borderTopWidth: 1,
     borderTopColor: C.border,
+    paddingTop: 24,
+    paddingHorizontal: 20,
   },
-  statusIconContainer: {
-    width: 56,
-    height: 56,
-    borderRadius: 28,
-    backgroundColor: C.card,
+  panelInner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 16,
+    marginBottom: 18,
+  },
+  iconRing: {
+    width: 48,
+    height: 48,
+    borderRadius: 12,
+    borderWidth: 1.5,
+    backgroundColor: 'rgba(255,255,255,0.04)',
     alignItems: 'center',
     justifyContent: 'center',
-    marginBottom: 14,
+    flexShrink: 0,
   },
-  statusIconSuccess: {
-    backgroundColor: C.success + '18',
+  textBlock: {
+    flex: 1,
   },
-  statusIconDanger: {
-    backgroundColor: C.danger + '18',
+  label: {
+    fontSize: 18,
+    fontWeight: '700',
+    marginBottom: 3,
+    letterSpacing: -0.2,
+    lineHeight: 22,
   },
-  resultName: {
-    color: C.text,
-    fontSize: 22,
-    lineHeight: 30,
-    fontWeight: '800',
-    textAlign: 'center',
-    marginBottom: 4,
-  },
-  resultSub: {
-    color: C.textSecondary,
+  sub: {
+    color: C.sub,
     fontSize: 13,
-    lineHeight: 18,
-    textAlign: 'center',
-    marginBottom: 16,
+    lineHeight: 24,
   },
 
-  simBarTrack: {
-    width: '100%',
-    height: 4,
-    backgroundColor: C.card,
-    borderRadius: 2,
+  simTrack: {
+    height: 2,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderRadius: 1,
     overflow: 'hidden',
-    marginBottom: 8,
-  },
-  simBarFill: {
-    height: '100%',
-    borderRadius: 2,
-  },
-  doneBtn: {
-    marginTop: 12,
-    width: '100%',
-    backgroundColor: C.primary,
-    borderRadius: 14,
-    paddingVertical: 16,
-    alignItems: 'center',
     marginBottom: 20,
   },
+  simFill: {
+    height: '100%',
+    borderRadius: 1,
+  },
+
+  doneBtn: {
+    backgroundColor: C.text,
+    borderRadius: 8,
+    paddingVertical: 14,
+    alignItems: 'center',
+    marginBottom: 4,
+  },
   doneBtnText: {
-    color: C.surface,
-    fontSize: 16,
-    lineHeight: 22,
+    color: C.bg,
+    fontSize: 15,
     fontWeight: '700',
+    letterSpacing: 0.1,
   },
 });
